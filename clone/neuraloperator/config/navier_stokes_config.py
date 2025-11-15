@@ -9,7 +9,7 @@ from .wandb import WandbConfig
 
 class NavierStokesOptConfig(OptimizationConfig):
     n_epochs: int = 600
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4  # Reduced from 3e-4 to prevent NaN
     training_loss: str = "h1"
     weight_decay: float = 1e-4
     scheduler: str = "StepLR"

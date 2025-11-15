@@ -15,6 +15,7 @@ class OptimizationConfig(ConfigBase):
     scheduler_patience: int = 50
     step_size: int = 100
     gamma: float = 0.5
+    grad_clip: Optional[float] = 1.0  # Gradient clipping value (None to disable, default 1.0)
 
 
 class PatchingConfig(ConfigBase):

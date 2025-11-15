@@ -153,6 +153,7 @@ def load_navier_stokes_pt(
     channel_dim=1,
     subsampling_rate=None,
     num_workers=1,
+    pin_memory=True,
 ):
     dataset = NavierStokesDataset(
         root_dir=data_root,
@@ -174,7 +175,7 @@ def load_navier_stokes_pt(
         dataset.train_db,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=False,
     )
 
@@ -185,7 +186,7 @@ def load_navier_stokes_pt(
             batch_size=test_bsize,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
             persistent_workers=False,
         )
 

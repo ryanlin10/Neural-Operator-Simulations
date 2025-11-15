@@ -67,6 +67,7 @@ class Trainer:
         log_output: bool = False,
         use_distributed: bool = False,
         verbose: bool = False,
+        grad_clip: float = None,
     ):
         """ """
 
@@ -81,6 +82,7 @@ class Trainer:
         self.verbose = verbose
         self.use_distributed = use_distributed
         self.device = device
+        self.grad_clip = grad_clip  # Gradient clipping value (None to disable)
         # handle autocast device
         if isinstance(self.device, torch.device):
             self.autocast_device_type = self.device.type
@@ -94,6 +96,43 @@ class Trainer:
 
         # Track starting epoch for checkpointing/resuming
         self.start_epoch = 0
+
+    def _clip_gradients(self):
+        """Clip gradients, handling both real and complex-valued gradients.
+        
+        PyTorch's clip_grad_norm_ doesn't support complex gradients yet,
+        so we need a custom implementation that handles both cases.
+        """
+        if self.grad_clip is None:
+            return
+        
+        # Collect all gradients (both real and complex)
+        # Initialize as tensor to ensure consistent dtype/device
+        total_norm_squared = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        
+        for param in self.model.parameters():
+            if param.grad is not None:
+                grad = param.grad
+                if torch.is_complex(grad):
+                    # For complex gradients, compute squared norm (|a+bi|^2 = a^2 + b^2)
+                    # Use view_as_real to get real and imaginary parts
+                    grad_real = torch.view_as_real(grad)
+                    # grad_real has shape [..., 2] where last dim is [real, imag]
+                    total_norm_squared = total_norm_squared + grad_real.pow(2).sum()
+                else:
+                    # For real gradients, compute squared norm
+                    total_norm_squared = total_norm_squared + grad.pow(2).sum()
+        
+        # Compute total norm
+        total_norm = torch.sqrt(total_norm_squared + 1e-6)
+        
+        # Clip if norm exceeds threshold
+        if total_norm.item() > self.grad_clip:
+            clip_coef = torch.tensor(self.grad_clip / total_norm.item(), device=self.device, dtype=torch.float32)
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    # Both real and complex gradients can be multiplied by scalar
+                    param.grad.mul_(clip_coef)
 
     def train(
         self,
@@ -296,7 +335,53 @@ class Trainer:
         for idx, sample in enumerate(train_loader):
             loss = self.train_one_batch(idx, sample, training_loss)
             loss.backward()
+            
+            # Simple progress indicator every 100 batches
+            if idx > 0 and idx % 100 == 0:
+                print(f"  [Epoch {self.epoch}] Processed {idx} batches, current loss: {loss.item():.6f}")
+            
+            # Check gradients before clipping (only for first batch to avoid slowdown)
+            if self.epoch == 0 and idx == 0:
+                has_nan_grad = False
+                max_grad_norm = 0.0
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        grad = param.grad
+                        if torch.isnan(grad).any() or torch.isinf(grad).any():
+                            print(f"  ⚠️  NaN/Inf gradient in {name}!")
+                            has_nan_grad = True
+                        # Compute norm handling both real and complex gradients
+                        if torch.is_complex(grad):
+                            grad_real = torch.view_as_real(grad)
+                            grad_norm = torch.sqrt(grad_real.pow(2).sum()).item()
+                        else:
+                            grad_norm = torch.sqrt(grad.pow(2).sum()).item()
+                        max_grad_norm = max(max_grad_norm, grad_norm)
+                if has_nan_grad:
+                    print(f"  ⚠️  NaN/Inf gradients detected before clipping!")
+                else:
+                    print(f"  ✓ Gradients OK before clipping (max norm: {max_grad_norm:.6f})")
+            
+            # Gradient clipping to prevent explosion
+            # Handle complex gradients which PyTorch's clip_grad_norm_ doesn't support
+            if self.grad_clip is not None:
+                self._clip_gradients()
+            
             self.optimizer.step()
+            
+            # Check weights after optimizer step (only for first batch to avoid slowdown)
+            if self.epoch == 0 and idx == 0:
+                has_nan_param = False
+                for name, param in self.model.named_parameters():
+                    if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                        print(f"  ⚠️  NaN/Inf in parameter {name} after optimizer step!")
+                        has_nan_param = True
+                if has_nan_param:
+                    print(f"  ⚠️  Model weights corrupted after optimizer step!")
+                else:
+                    print(f"  ✓ Model weights OK after optimizer step")
+            
+            self.optimizer.zero_grad()
 
             train_err += loss.item()
             with torch.no_grad():
@@ -510,30 +595,268 @@ class Trainer:
             # load data to device if no preprocessor exists
             sample = {k: v.to(self.device) for k, v in sample.items() if torch.is_tensor(v)}
 
+        # Debug: Check for NaN in input data and normalization stats
+        if self.epoch == 0 and idx == 0:
+            x = sample.get("x", None)
+            y = sample.get("y", None)
+            if x is not None and torch.is_tensor(x):
+                has_nan = torch.isnan(x).any()
+                has_inf = torch.isinf(x).any()
+                if has_nan or has_inf:
+                    print(f"⚠️  WARNING: Input x contains NaN/Inf! NaN: {has_nan}, Inf: {has_inf}")
+                else:
+                    x_min, x_max, x_mean = x.min().item(), x.max().item(), x.mean().item()
+                    print(f"✓ Input x is valid: shape={x.shape}, min={x_min:.6f}, max={x_max:.6f}, mean={x_mean:.6f}")
+                    # Check for extreme values that might cause numerical issues
+                    if abs(x_max) > 100 or abs(x_min) > 100:
+                        print(f"   ⚠️  WARNING: Input x has extreme values (>100), might cause numerical instability")
+            if y is not None and torch.is_tensor(y):
+                has_nan = torch.isnan(y).any()
+                has_inf = torch.isinf(y).any()
+                if has_nan or has_inf:
+                    print(f"⚠️  WARNING: Target y contains NaN/Inf! NaN: {has_nan}, Inf: {has_inf}")
+                else:
+                    y_min, y_max, y_mean = y.min().item(), y.max().item(), y.mean().item()
+                    print(f"✓ Target y is valid: shape={y.shape}, min={y_min:.6f}, max={y_max:.6f}, mean={y_mean:.6f}")
+            
+            # Check normalization statistics if data processor exists
+            if self.data_processor is not None:
+                if hasattr(self.data_processor, 'in_normalizer') and self.data_processor.in_normalizer is not None:
+                    in_mean = self.data_processor.in_normalizer.mean
+                    in_std = self.data_processor.in_normalizer.std
+                    print(f"✓ Input normalizer: mean shape={in_mean.shape if hasattr(in_mean, 'shape') else 'scalar'}, "
+                          f"std min={in_std.min().item() if hasattr(in_std, 'min') else in_std:.6f}, "
+                          f"std max={in_std.max().item() if hasattr(in_std, 'max') else in_std:.6f}")
+                    if hasattr(in_std, 'min') and in_std.min().item() < 1e-6:
+                        print(f"   ⚠️  WARNING: Input std is very small (<1e-6), normalization might produce extreme values")
+                if hasattr(self.data_processor, 'out_normalizer') and self.data_processor.out_normalizer is not None:
+                    out_mean = self.data_processor.out_normalizer.mean
+                    out_std = self.data_processor.out_normalizer.std
+                    print(f"✓ Output normalizer: mean shape={out_mean.shape if hasattr(out_mean, 'shape') else 'scalar'}, "
+                          f"std min={out_std.min().item() if hasattr(out_std, 'min') else out_std:.6f}, "
+                          f"std max={out_std.max().item() if hasattr(out_std, 'max') else out_std:.6f}")
+                    if hasattr(out_std, 'min') and out_std.min().item() < 1e-6:
+                        print(f"   ⚠️  WARNING: Output std is very small (<1e-6), normalization might produce extreme values")
+
         if isinstance(sample["y"], torch.Tensor):
             self.n_samples += sample["y"].shape[0]
         else:
             self.n_samples += 1
 
-        if self.mixed_precision:
-            with torch.autocast(device_type=self.autocast_device_type):
-                out = self.model(**sample)
-        else:
-            out = self.model(**sample)
+        # Extract 'x' from sample - model only expects input, not target 'y'
+        x = sample.get("x", None)
+        if x is None:
+            raise ValueError("Sample dictionary must contain 'x' key for model input")
         
-        if self.epoch == 0 and idx == 0 and self.verbose and isinstance(out, torch.Tensor):
-            print(f"Raw outputs of shape {out.shape}")
+        # Debug: Check model weights for NaN before forward pass and test with dummy data
+        if self.epoch == 0 and idx == 0:
+            has_nan_params = False
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and torch.isnan(param).any():
+                    print(f"⚠️  WARNING: Parameter {name} contains NaN!")
+                    has_nan_params = True
+            if not has_nan_params:
+                print("✓ All model parameters are valid (no NaN)")
+            
+            # Test model with dummy data to see if it's a data issue or model issue
+            print("\n🔍 Testing model with dummy data...")
+            dummy_x = torch.randn_like(x)
+            self.model.eval()
+            with torch.no_grad():
+                dummy_out = self.model(dummy_x)
+                if torch.isnan(dummy_out).any():
+                    print(f"⚠️  Model produces NaN even with random dummy data!")
+                    print(f"   This suggests a model architecture issue, not a data issue.")
+                else:
+                    print(f"✓ Model works fine with dummy data (output shape: {dummy_out.shape})")
+            self.model.train()
+            
+            # Add forward hooks to trace where NaN appears - more comprehensive
+            nan_detected_in = []
+            
+            def check_nan_hook(name):
+                def hook(module, input, output):
+                    if isinstance(output, torch.Tensor):
+                        if torch.isnan(output).any() or torch.isinf(output).any():
+                            if name not in nan_detected_in:
+                                nan_detected_in.append(name)
+                                print(f"\n⚠️  NaN/Inf FIRST detected in {name}!")
+                                print(f"   Output shape: {output.shape}")
+                                print(f"   Has NaN: {torch.isnan(output).any().item()}, Has Inf: {torch.isinf(output).any().item()}")
+                                if isinstance(input, tuple) and len(input) > 0 and isinstance(input[0], torch.Tensor):
+                                    inp = input[0]
+                                    print(f"   Input stats: min={inp.min().item():.6f}, max={inp.max().item():.6f}, "
+                                          f"mean={inp.mean().item():.6f}, has_nan={torch.isnan(inp).any().item()}")
+                return hook
+            
+            # Register hooks on key modules
+            hooks = []
+            if hasattr(self.model, 'positional_embedding') and self.model.positional_embedding is not None:
+                hooks.append(self.model.positional_embedding.register_forward_hook(check_nan_hook('positional_embedding')))
+            if hasattr(self.model, 'lifting'):
+                hooks.append(self.model.lifting.register_forward_hook(check_nan_hook('lifting')))
+            if hasattr(self.model, 'fno_blocks'):
+                hooks.append(self.model.fno_blocks.register_forward_hook(check_nan_hook('fno_blocks')))
+            if hasattr(self.model, 'projection'):
+                hooks.append(self.model.projection.register_forward_hook(check_nan_hook('projection')))
+            
+            # Also check intermediate outputs manually by wrapping forward
+            print(f"\n[DEBUG] Testing model forward pass step-by-step...")
+            print(f"  Input x shape: {x.shape}, dtype: {x.dtype}")
+            print(f"  Input x stats: min={x.min().item():.6f}, max={x.max().item():.6f}, mean={x.mean().item():.6f}")
+            
+            # Test each component manually through the entire forward pass
+            test_x = x.clone()
+            nan_found = False
+            
+            if hasattr(self.model, 'positional_embedding') and self.model.positional_embedding is not None:
+                test_x = self.model.positional_embedding(test_x)
+                if torch.isnan(test_x).any():
+                    print(f"  ⚠️  NaN after positional_embedding!")
+                    nan_found = True
+                else:
+                    print(f"  ✓ positional_embedding OK: shape={test_x.shape}")
+            
+            if not nan_found and hasattr(self.model, 'lifting'):
+                test_x = self.model.lifting(test_x)
+                if torch.isnan(test_x).any():
+                    print(f"  ⚠️  NaN after lifting!")
+                    nan_found = True
+                else:
+                    print(f"  ✓ lifting OK: shape={test_x.shape}, stats: min={test_x.min().item():.6f}, max={test_x.max().item():.6f}")
+            
+            # Test domain padding if it exists
+            if not nan_found and hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
+                test_x = self.model.domain_padding.pad(test_x)
+                if torch.isnan(test_x).any():
+                    print(f"  ⚠️  NaN after domain_padding.pad!")
+                    nan_found = True
+                else:
+                    print(f"  ✓ domain_padding.pad OK: shape={test_x.shape}")
+            
+            # Test FNO blocks layer by layer
+            if not nan_found and hasattr(self.model, 'fno_blocks') and hasattr(self.model.fno_blocks, 'n_layers'):
+                for layer_idx in range(self.model.fno_blocks.n_layers):
+                    test_x_before = test_x.clone()
+                    test_x = self.model.fno_blocks(test_x, layer_idx)
+                    if torch.isnan(test_x).any():
+                        print(f"  ⚠️  NaN after fno_blocks layer {layer_idx}!")
+                        print(f"     Input stats before layer: min={test_x_before.min().item():.6f}, max={test_x_before.max().item():.6f}")
+                        nan_found = True
+                        break
+                    else:
+                        print(f"  ✓ fno_blocks layer {layer_idx} OK: shape={test_x.shape}, stats: min={test_x.min().item():.6f}, max={test_x.max().item():.6f}")
+            
+            # Test domain unpadding if it exists
+            if not nan_found and hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
+                test_x = self.model.domain_padding.unpad(test_x)
+                if torch.isnan(test_x).any():
+                    print(f"  ⚠️  NaN after domain_padding.unpad!")
+                    nan_found = True
+                else:
+                    print(f"  ✓ domain_padding.unpad OK: shape={test_x.shape}")
+            
+            # Test projection
+            if not nan_found and hasattr(self.model, 'projection'):
+                test_x_before = test_x.clone()
+                test_x = self.model.projection(test_x)
+                if torch.isnan(test_x).any():
+                    print(f"  ⚠️  NaN after projection!")
+                    print(f"     Input stats before projection: min={test_x_before.min().item():.6f}, max={test_x_before.max().item():.6f}")
+                    nan_found = True
+                else:
+                    print(f"  ✓ projection OK: shape={test_x.shape}, stats: min={test_x.min().item():.6f}, max={test_x.max().item():.6f}")
+            
+            if not nan_found:
+                print(f"  ✓ Full forward pass completed successfully!")
+            
+            # Reset test_x for actual forward pass
+            test_x = None
+        else:
+            hooks = []
+        
+        # Check input before forward pass (only for first batch to avoid slowdown)
+        if torch.is_tensor(x) and (self.epoch == 0 and idx == 0):
+            x_has_nan = torch.isnan(x).any().item()
+            x_has_inf = torch.isinf(x).any().item()
+            x_max_abs = x.abs().max().item()
+            x_min, x_max, x_mean = x.min().item(), x.max().item(), x.mean().item()
+            print(f"\n[DEBUG Epoch {self.epoch}, Batch {idx}] Input x check:")
+            print(f"  Shape: {x.shape}, dtype: {x.dtype}")
+            print(f"  Stats: min={x_min:.6f}, max={x_max:.6f}, mean={x_mean:.6f}, max_abs={x_max_abs:.6f}")
+            print(f"  Has NaN: {x_has_nan}, Has Inf: {x_has_inf}")
+            if x_has_nan or x_has_inf or x_max_abs > 1e6:
+                print(f"  ⚠️  WARNING: Input x has issues!")
+                if x_max_abs > 1e6:
+                    print(f"  ⚠️  Extreme values detected! This will likely cause NaN in model.")
+            print()
+        
+        try:
+            if self.mixed_precision:
+                with torch.autocast(device_type=self.autocast_device_type):
+                    out = self.model(x)
+            else:
+                out = self.model(x)
+        finally:
+            # Remove hooks after forward pass
+            if self.epoch == 0 and idx == 0:
+                for hook in hooks:
+                    hook.remove()
+        
+        # Debug: Check for NaN in model output immediately after forward pass
+        if isinstance(out, torch.Tensor):
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                # Only print detailed warning for first few batches to avoid clutter
+                if self.epoch == 0 and idx < 3:
+                    print(f"\n{'='*60}")
+                    print(f"⚠️  CRITICAL: Model output contains NaN/Inf!")
+                    print(f"   Epoch: {self.epoch}, Batch: {idx}")
+                    print(f"   Output shape: {out.shape}")
+                    print(f"   Has NaN: {torch.isnan(out).any().item()}, Has Inf: {torch.isinf(out).any().item()}")
+                    # Check input to model
+                    if torch.is_tensor(x):
+                        print(f"   Input x stats: min={x.min().item():.6f}, max={x.max().item():.6f}, mean={x.mean().item():.6f}")
+                        print(f"   Input x has NaN: {torch.isnan(x).any().item()}, Inf: {torch.isinf(x).any().item()}")
+                        # Check for extreme values
+                        if x.abs().max() > 100:
+                            print(f"   ⚠️  Input has extreme values (max abs: {x.abs().max().item():.2f})")
+                    print(f"{'='*60}\n")
 
         if self.data_processor is not None:
             out, sample = self.data_processor.postprocess(out, sample)
 
         loss = 0.0
 
+        # Fix: Pass y explicitly as positional argument to match loss function signature
+        y = sample.get("y", None)
+        if y is None:
+            raise ValueError("Sample dictionary must contain 'y' key for loss computation")
+        
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss += training_loss(out, **sample)
+                loss_val = training_loss(out, y)
         else:
-            loss += training_loss(out, **sample)
+            loss_val = training_loss(out, y)
+        
+        # Debug: Check for NaN in loss
+        if torch.is_tensor(loss_val):
+            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                # Only print detailed diagnostics once per epoch to avoid spam
+                if idx == 0:
+                    print(f"\n⚠️  WARNING: Loss is NaN/Inf! Loss value: {loss_val}")
+                    print(f"   Epoch: {self.epoch}, Batch: {idx}")
+                    if torch.is_tensor(out):
+                        print(f"   Output stats: min={out.min().item():.6f}, max={out.max().item():.6f}, mean={out.mean().item():.6f}")
+                        print(f"   Output has NaN: {torch.isnan(out).any().item()}, Inf: {torch.isinf(out).any().item()}")
+                    if torch.is_tensor(y):
+                        print(f"   Target stats: min={y.min().item():.6f}, max={y.max().item():.6f}, mean={y.mean().item():.6f}")
+                        print(f"   Target has NaN: {torch.isnan(y).any().item()}, Inf: {torch.isinf(y).any().item()}")
+                    # Check if shapes match
+                    if torch.is_tensor(out) and torch.is_tensor(y):
+                        if out.shape != y.shape:
+                            print(f"   ⚠️  Shape mismatch! Output: {out.shape}, Target: {y.shape}")
+        
+        loss += loss_val
 
         if self.regularizer:
             loss += self.regularizer.loss
@@ -570,15 +893,24 @@ class Trainer:
 
         self.n_samples += sample["y"].size(0)
 
-        out = self.model(**sample)
+        # Extract 'x' from sample - model only expects input, not target 'y'
+        x = sample.get("x", None)
+        if x is None:
+            raise ValueError("Sample dictionary must contain 'x' key for model input")
+        out = self.model(x)
 
         if self.data_processor is not None:
             out, sample = self.data_processor.postprocess(out, sample)
 
         eval_step_losses = {}
 
+        # Fix: Pass y explicitly as positional argument
+        y = sample.get("y", None)
+        if y is None:
+            raise ValueError("Sample dictionary must contain 'y' key for loss computation")
+        
         for loss_name, loss in eval_losses.items():
-            val_loss = loss(out, **sample)
+            val_loss = loss(out, y)
             eval_step_losses[loss_name] = val_loss
 
         if return_output:
@@ -651,13 +983,22 @@ class Trainer:
                 self.n_samples += sample["y"].shape[0]
                 sample_count_incr = True
 
-            out = self.model(**sample)
+            # Extract 'x' from sample - model only expects input, not target 'y'
+            x = sample.get("x", None)
+            if x is None:
+                raise ValueError("Sample dictionary must contain 'x' key for model input")
+            out = self.model(x)
 
             if self.data_processor is not None:
                 out, sample = self.data_processor.postprocess(out, sample, step=t)
 
+            # Fix: Pass y explicitly as positional argument
+            y = sample.get("y", None)
+            if y is None:
+                raise ValueError("Sample dictionary must contain 'y' key for loss computation")
+            
             for loss_name, loss in eval_losses.items():
-                step_loss = loss(out, **sample)
+                step_loss = loss(out, y)
                 eval_step_losses[loss_name] += step_loss
 
             t += 1

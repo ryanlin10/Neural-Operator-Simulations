@@ -155,7 +155,11 @@ class AdamW(Optimizer):
                     # Exponential moving average of gradient values
                     state["exp_avg"] = torch.zeros_like(grad)
                     # Exponential moving average of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(grad)
+                    # For complex gradients, exp_avg_sq should be real (grad * grad.conj() is always real)
+                    if torch.is_complex(grad):
+                        state["exp_avg_sq"] = torch.zeros_like(grad.real)
+                    else:
+                        state["exp_avg_sq"] = torch.zeros_like(grad)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]
@@ -166,10 +170,14 @@ class AdamW(Optimizer):
                 # In-place operations to update the averages at the same time
                 exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
                 if torch.is_complex(grad):
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1.0 - beta2)
+                    # For complex gradients, grad * grad.conj() is always real
+                    # Update exp_avg_sq with real values
+                    grad_sq_real = (grad * grad.conj()).real
+                    exp_avg_sq.mul_(beta2).add_(grad_sq_real, alpha=(1.0 - beta2))
+                    denom = exp_avg_sq.sqrt().add_(group["eps"])
                 else:
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                denom = exp_avg_sq.sqrt().add_(group["eps"])
+                    denom = exp_avg_sq.sqrt().add_(group["eps"])
 
                 step_size = group["lr"]
                 if group["correct_bias"]:  # No bias correction for Bert
@@ -195,6 +203,9 @@ class AdamW(Optimizer):
                 # of the weights to the loss with plain (non-momentum) SGD.
                 # Add weight decay at the end (fixed version)
                 if group["weight_decay"] > 0.0:
-                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    # Weight decay: p = p * (1 - lr * weight_decay)
+                    # This works for both real and complex parameters
+                    decay_factor = 1.0 - group["lr"] * group["weight_decay"]
+                    p.mul_(decay_factor)
 
         return loss
