@@ -136,11 +136,21 @@ def main():
             )
 
     # Create the optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config.opt.learning_rate,
-        weight_decay=config.opt.weight_decay,
-    )
+    if config.opt.optimizer == "SGD":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config.opt.learning_rate,
+            momentum=config.opt.sgd_momentum,
+            weight_decay=config.opt.weight_decay,
+        )
+    elif config.opt.optimizer == "AdamW":
+        optimizer = AdamW(
+            model.parameters(),
+            lr=config.opt.learning_rate,
+            weight_decay=config.opt.weight_decay,
+        )
+    else:
+        raise ValueError(f"Got optimizer={config.opt.optimizer}, expected one of ['SGD', 'AdamW']")
 
     if config.opt.scheduler == "ReduceLROnPlateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -198,6 +208,7 @@ def main():
         verbose=config.verbose,
         wandb_log=config.wandb.log,
         grad_clip=config.opt.grad_clip,
+        grad_noise_scale=config.opt.grad_noise_scale,
     )
 
     # Log model parameter count
@@ -219,15 +230,24 @@ def main():
 
 
     # Start training process
-    trainer.train(
-        train_loader,
-        test_loaders,
-        optimizer,
-        scheduler,
-        regularizer=False,
-        training_loss=train_loss,
-        eval_losses=eval_losses,
-    )
+    try:
+        trainer.train(
+            train_loader,
+            test_loaders,
+            optimizer,
+            scheduler,
+            regularizer=False,
+            training_loss=train_loss,
+            eval_losses=eval_losses,
+            save_dir=config.checkpoint.save_dir,
+            save_best=config.checkpoint.save_best,
+            save_every=config.checkpoint.save_every,
+        )
+    except KeyboardInterrupt:
+        if config.verbose and is_logger:
+            print("\n[Training interrupted] Cleaning up and exiting...")
+        # Training was interrupted, but we still want to clean up
+        pass
 
     # Finalize WandB logging
     if config.wandb.log and is_logger:

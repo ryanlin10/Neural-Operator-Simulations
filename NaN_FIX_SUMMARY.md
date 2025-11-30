@@ -93,3 +93,5 @@ Created a diagnostic script to check for NaN values in:
 4. `clone/neuraloperator/scripts/train_navier_stokes.py` - Pass grad_clip to trainer
 5. `tests/debug_nan.py` - Created diagnostic script
 
+
+
